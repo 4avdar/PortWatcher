@@ -1,0 +1,185 @@
+<import sqlite3
+import subprocess
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+
+DB_FILE = "portwatch.db"
+TARGET = "127.0.0.1"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target TEXT NOT NULL,
+            scan_time TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id INTEGER NOT NULL,
+            port INTEGER NOT NULL,
+            protocol TEXT NOT NULL,
+            state TEXT NOT NULL,
+            service TEXT,
+            FOREIGN KEY (scan_id) REFERENCES scans(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def run_nmap(target):
+    cmd = ["nmap", "-oX", "-", target]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+def parse_nmap_xml(xml_data):
+    ports_found = []
+    root = ET.fromstring(xml_data)
+
+    for host in root.findall("host"):
+        ports = host.find("ports")
+        if ports is None:
+            continue
+
+        for port in ports.findall("port"):
+            protocol = port.get("protocol")
+            portid = int(port.get("portid"))
+
+            state_el = port.find("state")
+            service_el = port.find("service")
+
+            state = state_el.get("state") if state_el is not None else "unknown"
+            service = service_el.get("name") if service_el is not None else "unknown"
+
+            if state == "open":
+                ports_found.append({
+                    "port": portid,
+                    "protocol": protocol,
+                    "state": state,
+                    "service": service
+                })
+
+    return ports_found
+
+
+def save_scan(target, ports):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("INSERT INTO scans (target, scan_time) VALUES (?, ?)", (target, scan_time))
+    scan_id = cur.lastrowid
+
+    for p in ports:
+        cur.execute("""
+            INSERT INTO ports (scan_id, port, protocol, state, service)
+            VALUES (?, ?, ?, ?, ?)
+        """, (scan_id, p["port"], p["protocol"], p["state"], p["service"]))
+
+    conn.commit()
+    conn.close()
+    return scan_id, scan_time
+
+
+def get_previous_scan_id(current_scan_id, target):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id
+        FROM scans
+        WHERE target = ? AND id < ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (target, current_scan_id))
+
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_ports_for_scan(scan_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT port, protocol, state, service
+        FROM ports
+        WHERE scan_id = ?
+    """, (scan_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        (row[0], row[1], row[3]) for row in rows
+    }
+
+
+def compare_scans(old_ports, new_ports):
+    opened = new_ports - old_ports
+    closed = old_ports - new_ports
+    unchanged = new_ports & old_ports
+    return opened, closed, unchanged
+
+
+def print_results(scan_time, current_ports, opened, closed, unchanged):
+    print(f"\nScan time: {scan_time}\n")
+
+    print("Open ports now:")
+    if current_ports:
+        for port, proto, service in sorted(current_ports):
+            print(f"  {port}/{proto}  {service}")
+    else:
+        print("  No open ports found.")
+
+    print("\nChanges since last scan:")
+
+    if opened:
+        for port, proto, service in sorted(opened):
+            print(f"  + {port}/{proto} opened ({service})")
+
+    if closed:
+        for port, proto, service in sorted(closed):
+            print(f"  - {port}/{proto} closed ({service})")
+
+    if unchanged:
+        for port, proto, service in sorted(unchanged):
+            print(f"  = {port}/{proto} unchanged ({service})")
+
+    if not opened and not closed and not unchanged:
+        print("  No previous scan to compare.")
+
+
+def main():
+    init_db()
+
+    xml_data = run_nmap(TARGET)
+    ports = parse_nmap_xml(xml_data)
+
+    current_scan_id, scan_time = save_scan(TARGET, ports)
+    previous_scan_id = get_previous_scan_id(current_scan_id, TARGET)
+
+    current_ports = {(p["port"], p["protocol"], p["service"]) for p in ports}
+
+    if previous_scan_id is not None:
+        previous_ports = get_ports_for_scan(previous_scan_id)
+        opened, closed, unchanged = compare_scans(previous_ports, current_ports)
+    else:
+        opened, closed, unchanged = set(), set(), set()
+
+    print_results(scan_time, current_ports, opened, closed, unchanged)
+
+
+if __name__ == "__main__":
+    main()
